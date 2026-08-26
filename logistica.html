@@ -378,6 +378,8 @@ async function fetchRecebimentoZenerp(codigos) {
     }
   };
 
+  showToast('Coletando dados...', 'info', true);
+
   const resultadoRecebimento = await chamarApiJson(
     "Relatório Recebimento",
     "https://api.zenerp.app.br/system/data/dataSourceOpRead?order=+product_id",
@@ -395,12 +397,31 @@ async function fetchRecebimentoZenerp(codigos) {
   if (!resultadoRecebimento.ok) return null;
 
   const json = resultadoRecebimento.data;
-  return codigos.map(codigo => {
-    const item = json.find(row =>
-      Object.values(row).some(v => typeof v === 'string' && v.includes(codigo))
-    );
-    return item ? (Number(item['sum_quantity']) || 0) : 0;
+  if (!Array.isArray(json)) {
+    console.error('[Recebimento] Resposta da API não veio como lista (formato inesperado):', json);
+    return null;
+  }
+  console.log(`[Recebimento] API ZenERP retornou ${json.length} linha(s).`, json);
+
+  let matched = 0;
+  const naoEncontrados = [];
+  const values = codigos.map(codigo => {
+    // Pode haver mais de uma linha por produto (separadas por lote/qualidade/serial) — soma todas.
+    const linhas = json.filter(row => String(row.product_code) === String(codigo));
+    if (!linhas.length) {
+      naoEncontrados.push(codigo);
+      return 0;
+    }
+    matched++;
+    return linhas.reduce((soma, row) => soma + (Number(row.sum_quantity) || 0), 0);
   });
+
+  console.log(`[Recebimento] ${matched}/${codigos.length} código(s) da planilha encontrados na resposta do ZenERP.`);
+  if (naoEncontrados.length) {
+    console.warn('[Recebimento] Códigos NÃO encontrados na resposta do ZenERP:', naoEncontrados);
+  }
+
+  return { values, matched, total: codigos.length };
 }
 
 // AUTH CHECK
@@ -659,14 +680,21 @@ async function parseStock(wb) {
     RECEBIMENTO: Number(get(row, iReceb)) || 0,
   })).filter(r => r.CODIGO);
 
-  // MODO TESTE: sem fallback para o Excel — se a API do ZenERP falhar, estoura erro.
+  // Tenta atualizar RECEBIMENTO com dado ao vivo do ZenERP; se a API falhar ou não achar
+  // nenhuma correspondência, mantém os valores lidos da planilha (fallback).
   if (allStock.length) {
     const codigos = allStock.map(r => r.CODIGO);
-    const itemsRecebimento = await fetchRecebimentoZenerp(codigos);
-    if (!itemsRecebimento) {
-      throw new Error('Falha ao buscar RECEBIMENTO no ZenERP (ver console para detalhes).');
+    const resultado = await fetchRecebimentoZenerp(codigos);
+    if (!resultado || resultado.matched === 0) {
+      console.warn('[Recebimento] API ZenERP indisponível ou sem correspondências, mantendo valores da planilha.');
+      showToast('Não foi possível obter dados do ZenERP — usando valores da planilha.', 'err');
+    } else {
+      allStock.forEach((r, i) => { r.RECEBIMENTO = resultado.values[i]; });
+      showToast(
+        `Recebimento ZenERP: ${resultado.matched}/${resultado.total} itens encontrados.`,
+        resultado.matched === resultado.total ? 'ok' : 'info'
+      );
     }
-    allStock.forEach((r, i) => { r.RECEBIMENTO = itemsRecebimento[i]; });
   }
 }
 
@@ -993,13 +1021,15 @@ function closeModal(e) {
 }
 
 // SAVE TO SUPABASE
-function showToast(msg, type = 'ok') {
+function showToast(msg, type = 'ok', persist = false) {
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.className = `toast toast-${type}`;
   t.classList.remove('hidden');
   clearTimeout(t._timer);
-  t._timer = setTimeout(() => t.classList.add('hidden'), 5000);
+  if (!persist) {
+    t._timer = setTimeout(() => t.classList.add('hidden'), 5000);
+  }
 }
 
 async function saveToSupabase() {

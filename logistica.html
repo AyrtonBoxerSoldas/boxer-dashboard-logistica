@@ -424,6 +424,65 @@ async function fetchRecebimentoZenerp(codigos) {
   return { values, matched, total: codigos.length };
 }
 
+// Busca o ESTOQUE_ATUAL no ZenERP para cada código informado, via stockAvailabilityCube
+// (retorna quantity_stock já pronto, sem precisar filtrar/classificar por endereço).
+// Retorna { values, matched, total }, ou null se a API falhar.
+async function fetchEstoqueZenerp(codigos) {
+  const jsonBodyEstoque = {
+    code: "/salesbreath/stockAvailabilityCube",
+    parameters: {
+      SHOW_PRODUCT: true,
+      SHOW_PRODUCT_PACKING: true,
+      SHOW_SCHEDULE: true
+    }
+  };
+
+  showToast('Coletando dados...', 'info', true);
+
+  const resultadoEstoque = await chamarApiJson(
+    "Relatório Estoque",
+    "https://api.zenerp.app.br/system/data/dataSourceOpRead",
+    {
+      method: "POST",
+      headers: {
+        "Tenant": "boxer",
+        "Authorization": "Bearer " + ZENERP_TOKEN,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(jsonBodyEstoque)
+    }
+  );
+
+  if (!resultadoEstoque.ok) return null;
+
+  const json = resultadoEstoque.data;
+  if (!Array.isArray(json)) {
+    console.error('[Estoque] Resposta da API não veio como lista (formato inesperado):', json);
+    return null;
+  }
+  console.log(`[Estoque] API ZenERP retornou ${json.length} linha(s).`, json);
+
+  let matched = 0;
+  const naoEncontrados = [];
+  const values = codigos.map(codigo => {
+    // Pode haver mais de uma linha por produto (ex. schedule/qualidade diferentes) — soma todas.
+    const linhas = json.filter(row => String(row.product_code) === String(codigo));
+    if (!linhas.length) {
+      naoEncontrados.push(codigo);
+      return 0;
+    }
+    matched++;
+    return linhas.reduce((soma, row) => soma + (Number(row.quantity_stock) || 0), 0);
+  });
+
+  console.log(`[Estoque] ${matched}/${codigos.length} código(s) da planilha encontrados na resposta do ZenERP.`);
+  if (naoEncontrados.length) {
+    console.warn('[Estoque] Códigos NÃO encontrados na resposta do ZenERP:', naoEncontrados);
+  }
+
+  return { values, matched, total: codigos.length };
+}
+
 // AUTH CHECK
 const session = sessionStorage.getItem('boxer_log_session');
 if (!session) { location.href = 'index.html'; }
@@ -680,21 +739,38 @@ async function parseStock(wb) {
     RECEBIMENTO: Number(get(row, iReceb)) || 0,
   })).filter(r => r.CODIGO);
 
-  // Tenta atualizar RECEBIMENTO com dado ao vivo do ZenERP; se a API falhar ou não achar
-  // nenhuma correspondência, mantém os valores lidos da planilha (fallback).
+  // Tenta atualizar RECEBIMENTO e ESTOQUE_ATUAL com dado ao vivo do ZenERP; se alguma das
+  // chamadas falhar ou não achar nenhuma correspondência, mantém os valores lidos da planilha
+  // para aquele campo especificamente (fallback independente por campo).
   if (allStock.length) {
     const codigos = allStock.map(r => r.CODIGO);
-    const resultado = await fetchRecebimentoZenerp(codigos);
-    if (!resultado || resultado.matched === 0) {
-      console.warn('[Recebimento] API ZenERP indisponível ou sem correspondências, mantendo valores da planilha.');
-      showToast('Não foi possível obter dados do ZenERP — usando valores da planilha.', 'err');
+    const [recebimento, estoque] = await Promise.all([
+      fetchRecebimentoZenerp(codigos),
+      fetchEstoqueZenerp(codigos)
+    ]);
+
+    const recebOk = recebimento && recebimento.matched > 0;
+    if (recebOk) {
+      allStock.forEach((r, i) => { r.RECEBIMENTO = recebimento.values[i]; });
     } else {
-      allStock.forEach((r, i) => { r.RECEBIMENTO = resultado.values[i]; });
-      showToast(
-        `Recebimento ZenERP: ${resultado.matched}/${resultado.total} itens encontrados.`,
-        resultado.matched === resultado.total ? 'ok' : 'info'
-      );
+      console.warn('[Recebimento] API ZenERP indisponível ou sem correspondências, mantendo valores da planilha.');
     }
+
+    const estoqueOk = estoque && estoque.matched > 0;
+    if (estoqueOk) {
+      allStock.forEach((r, i) => { r.ESTOQUE_ATUAL = estoque.values[i]; });
+    } else {
+      console.warn('[Estoque] API ZenERP indisponível ou sem correspondências, mantendo valores da planilha.');
+    }
+
+    const partes = [
+      recebOk ? `Recebimento ${recebimento.matched}/${recebimento.total}` : 'Recebimento: planilha',
+      estoqueOk ? `Estoque ${estoque.matched}/${estoque.total}` : 'Estoque: planilha'
+    ];
+    showToast(
+      `ZenERP — ${partes.join(' · ')}`,
+      (recebOk && estoqueOk) ? 'ok' : (recebOk || estoqueOk) ? 'info' : 'err'
+    );
   }
 }
 
